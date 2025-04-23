@@ -201,14 +201,23 @@ class WaffleBotNode(Node):
 
     def setup_odometry(self):
         """Initialize odometry-related components (Arduino)"""
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
-        self.wheel_radius = 0.03  # meters
-        self.wheel_base = 0.18    # meters
-        self.ticks_per_rev = 360
+        # Initialize position/orientation state
+        self.x = 0.0         # Position x in meters
+        self.y = 0.0         # Position y in meters
+        self.theta = 0.0     # Orientation in radians
+        
+        # Robot physical parameters
+        self.wheel_radius = 0.03   # Wheel radius in meters
+        self.wheel_base = 0.18     # Distance between wheels in meters
+        self.ticks_per_rev = 360   # Encoder ticks per wheel revolution
+        
+        # Tracking variables
+        self.last_encoder1 = 0     # Previous left encoder value
+        self.last_encoder2 = 0     # Previous right encoder value
+        self.encoder1_count = 0    # Current left encoder value
+        self.encoder2_count = 0    # Current right encoder value
         self.odometry_enabled = False  # Track if odometry is enabled
-
+        
         # Skip Arduino connection if disabled
         if self.disable_arduino:
             return
@@ -219,6 +228,7 @@ class WaffleBotNode(Node):
             self.get_logger().warning('Could not connect to Arduino. Odometry disabled.')
         else:
             self.odometry_enabled = True
+            self.get_logger().info('Odometry enabled with encoder feedback')
             
     def try_arduino_connection(self):
         """Try connecting to Arduino with different baud rates if needed"""
@@ -530,6 +540,7 @@ class WaffleBotNode(Node):
                                 parts = [part.strip() for part in line.split('|')]
                                 
                                 # Extract Motor 1 count (should be in part at index 2)
+                                prev_encoder1 = self.encoder1_count
                                 for part in parts:
                                     if "Motor 1:" in part:
                                         motor1_str = part.replace("Motor 1:", "").strip()
@@ -539,6 +550,7 @@ class WaffleBotNode(Node):
                                             pass
                                 
                                 # Extract Motor 2 count (should be in part at index 3)
+                                prev_encoder2 = self.encoder2_count
                                 for part in parts:
                                     if "Motor 2:" in part:
                                         motor2_str = part.replace("Motor 2:", "").strip()
@@ -549,6 +561,10 @@ class WaffleBotNode(Node):
                                 
                                 # Display encoder counts at regular intervals
                                 self.display_encoder_data()
+                                
+                                # Calculate and publish odometry
+                                self.calculate_and_publish_odometry(prev_encoder1, prev_encoder2)
+                                
                             except Exception as e:
                                 if time_since_last >= 5.0:  # Log errors less frequently
                                     self.get_logger().warning(f"Error parsing Arduino data: {str(e)}")
@@ -565,6 +581,68 @@ class WaffleBotNode(Node):
             time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
             if time_since_last >= 5.0:
                 self.get_logger().warning(f"Error in update_odometry: {str(e)}")
+            
+    def calculate_and_publish_odometry(self, prev_encoder1, prev_encoder2):
+        """Calculate and publish odometry based on encoder changes"""
+        # Calculate encoder ticks change
+        d_encoder1 = self.encoder1_count - prev_encoder1
+        d_encoder2 = self.encoder2_count - prev_encoder2
+        
+        # If no change in encoders, nothing to update
+        if d_encoder1 == 0 and d_encoder2 == 0:
+            return
+        
+        # Calculate time difference
+        current_time = self.get_clock().now()
+        dt = (current_time - self.last_time).nanoseconds / 1e9
+        self.last_time = current_time
+        
+        # Skip if time difference is too small to avoid division by zero
+        if dt < 0.0001:
+            return
+        
+        # Convert encoder ticks to distance traveled by each wheel
+        left_dist = (2 * math.pi * self.wheel_radius) * (d_encoder1 / self.ticks_per_rev)
+        right_dist = (2 * math.pi * self.wheel_radius) * (d_encoder2 / self.ticks_per_rev)
+        
+        # Calculate robot's linear and angular displacement
+        dx = (left_dist + right_dist) / 2.0
+        dtheta = (right_dist - left_dist) / self.wheel_base
+        
+        # Update position and orientation
+        self.theta += dtheta
+        self.x += dx * math.cos(self.theta)
+        self.y += dx * math.sin(self.theta)
+        
+        # Create and publish odometry message
+        odom = Odometry()
+        odom.header.stamp = current_time.to_msg()
+        odom.header.frame_id = "odom"
+        odom.child_frame_id = "base_link"
+        
+        # Set position
+        odom.pose.pose.position.x = self.x
+        odom.pose.pose.position.y = self.y
+        odom.pose.pose.position.z = 0.0
+        
+        # Set orientation (quaternion from yaw)
+        q = euler2quat(0, 0, self.theta)
+        odom.pose.pose.orientation.w = q[0]
+        odom.pose.pose.orientation.x = q[1]
+        odom.pose.pose.orientation.y = q[2]
+        odom.pose.pose.orientation.z = q[3]
+        
+        # Set velocities
+        odom.twist.twist.linear.x = dx / dt
+        odom.twist.twist.angular.z = dtheta / dt
+        
+        # Publish odometry message
+        self.odom_pub.publish(odom)
+        
+        # Log odometry occasionally
+        time_since_last = (current_time - self.last_encoder_display_time).nanoseconds / 1e9
+        if time_since_last >= 5.0:
+            self.get_logger().info(f"Odometry: x={self.x:.2f}, y={self.y:.2f}, theta={self.theta:.2f}")
             
     def display_encoder_data(self):
         """Display encoder readings at a reasonable frequency"""
