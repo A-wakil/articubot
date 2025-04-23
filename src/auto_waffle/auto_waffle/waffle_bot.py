@@ -36,8 +36,12 @@ class WaffleBotNode(Node):
         self.last_cmd_vel_time = self.get_clock().now()
         self.cmd_vel_count = 0
         
-        # Arduino disable flag - set to True to run without Arduino
-        self.disable_arduino = True  # Set to True to disable Arduino connection attempts
+        # Arduino and encoder variables
+        self.disable_arduino = False  # Set to True to disable Arduino connection attempts
+        self.arduino_baudrate = 9600  # Arduino baud rate - try different values if not working
+        self.encoder1_count = 0
+        self.encoder2_count = 0
+        self.last_encoder_display_time = self.get_clock().now()
 
         # Flag to track if we're shutting down
         self.is_shutting_down = False
@@ -85,8 +89,10 @@ class WaffleBotNode(Node):
         
         # Add timers
         self.last_time = self.get_clock().now()
-        if self.odometry_enabled:  # Only create odometry timer if Arduino is connected
-            self.timer = self.create_timer(0.1, self.update_odometry)
+        if not self.disable_arduino:  # Create Arduino timers if Arduino is enabled
+            # Create timer to check for Arduino data at 10Hz
+            self.encoder_timer = self.create_timer(0.1, self.update_odometry)
+            # Create timer to check Arduino connection at 1Hz
             self.connection_timer = self.create_timer(1.0, self.check_arduino_connection)
         
         # Add a motor check timer
@@ -207,12 +213,38 @@ class WaffleBotNode(Node):
         if self.disable_arduino:
             return
 
-        # Try to connect to Arduino
-        self.connect_to_arduino()
+        # Try to connect to Arduino with different baud rates if needed
+        self.try_arduino_connection()
         if not self.ser:
             self.get_logger().warning('Could not connect to Arduino. Odometry disabled.')
         else:
             self.odometry_enabled = True
+            
+    def try_arduino_connection(self):
+        """Try connecting to Arduino with different baud rates if needed"""
+        # List of baud rates to try
+        baud_rates = [9600, 115200, 57600, 38400, 19200]
+        
+        # First try with the configured baud rate
+        self.connect_to_arduino()
+        
+        # If failed, try other common baud rates
+        if not self.ser:
+            self.get_logger().warning(f"Failed to connect at {self.arduino_baudrate} baud. Trying other rates...")
+            original_rate = self.arduino_baudrate
+            
+            for rate in baud_rates:
+                if rate != original_rate:  # Skip the one we already tried
+                    self.get_logger().info(f"Trying baud rate: {rate}")
+                    self.arduino_baudrate = rate
+                    self.connect_to_arduino()
+                    if self.ser:
+                        self.get_logger().info(f"Successfully connected at {rate} baud!")
+                        break
+            
+            # Restore original rate if all attempts failed
+            if not self.ser:
+                self.arduino_baudrate = original_rate
 
     def scale_pwm(self, speed):
         """Scale speed to PWM with minimum threshold"""
@@ -272,7 +304,12 @@ class WaffleBotNode(Node):
             'USB Serial'
         ]
         
+        # Use the configured baud rate
+        arduino_baud_rate = self.arduino_baudrate
+        self.get_logger().info(f"Trying to connect to Arduino at {arduino_baud_rate} baud")
+        
         ports = list(serial.tools.list_ports.comports())
+        self.get_logger().info(f"Available ports: {[p.device for p in ports]}")
         
         for port in ports:
             # Check if any of the Arduino identifiers are in the port description
@@ -283,20 +320,23 @@ class WaffleBotNode(Node):
                         self.ser.close()
                     
                     # Use a short timeout to avoid blocking
-                    self.ser = serial.Serial(port.device, 115200, timeout=0.1)
+                    self.ser = serial.Serial(port.device, arduino_baud_rate, timeout=0.5)
                     
                     # Clear any pending data
                     if self.ser.in_waiting:
                         self.ser.read(self.ser.in_waiting)
                     
-                    # Send a newline and wait for response
-                    self.ser.write(b'\n')
-                    time.sleep(0.2)  # Short wait instead of the original 2 seconds
+                    # Wait for Arduino to reset and initialize
+                    time.sleep(2.0)
                     
-                    self.get_logger().info(f'Connected to Arduino on {port.device}')
+                    # Send a test message
+                    self.ser.write(b'ROS:HELLO\n')
+                    time.sleep(0.1)
+                    
+                    self.get_logger().info(f'Connected to Arduino on {port.device} at {arduino_baud_rate} baud')
                     return
                 except serial.SerialException as e:
-                    pass
+                    self.get_logger().warning(f"Failed to connect to {port.device}: {str(e)}")
         
         # If no Arduino found with identifiers, try common device names
         common_ports = ['/dev/ttyACM0', '/dev/ttyUSB0', '/dev/ttyACM1', '/dev/ttyUSB1']
@@ -307,41 +347,64 @@ class WaffleBotNode(Node):
                     if self.ser and self.ser.is_open:
                         self.ser.close()
                     
-                    self.ser = serial.Serial(port, 115200, timeout=0.1)
+                    self.ser = serial.Serial(port, arduino_baud_rate, timeout=0.5)
                     
                     # Clear any pending data
                     if self.ser.in_waiting:
                         self.ser.read(self.ser.in_waiting)
                     
-                    time.sleep(0.2)  # Short wait
+                    # Wait for Arduino to reset
+                    time.sleep(2.0)
                     
-                    self.get_logger().info(f'Connected to Arduino on {port}')
+                    # Send a test message
+                    self.ser.write(b'ROS:HELLO\n')
+                    time.sleep(0.1)
+                    
+                    self.get_logger().info(f'Connected to Arduino on {port} at {arduino_baud_rate} baud')
                     return
-                except (serial.SerialException, OSError):
-                    continue
+                except (serial.SerialException, OSError) as e:
+                    self.get_logger().warning(f"Failed to connect to {port}: {str(e)}")
         
         # No Arduino found
         self.ser = None
+        self.get_logger().warning("No Arduino found on any port")
 
     def check_arduino_connection(self):
         """Periodically check if Arduino is still connected."""
         try:
             if not self.ser or not self.ser.is_open:
+                self.get_logger().info("Arduino disconnected. Attempting to reconnect...")
                 self.connect_to_arduino()
+                if self.ser:
+                    self.get_logger().info("Arduino reconnected successfully!")
             else:
-                # Try to write a simple byte to test connection
+                # Send a ping every few seconds to make sure connection is alive
+                self.ser.write(b'ROS:PING\n')
+                
+                # Check if we can read from the Arduino
                 try:
-                    # Send a newline character to Arduino
-                    self.ser.write(b'\n')
-                    # Read any pending data to clear buffer
-                    if self.ser.in_waiting:
-                        self.ser.read(self.ser.in_waiting)
+                    # If there's no data for a while, the connection might be broken
+                    if self.ser.in_waiting == 0:
+                        self.get_logger().info("No data from Arduino - sending test message")
+                        self.ser.write(b'ROS:TEST\n')
                 except Exception as e:
-                    self.ser.close()
+                    self.get_logger().warning(f"Arduino connection error: {str(e)}")
+                    if self.ser:
+                        try:
+                            self.ser.close()
+                        except:
+                            pass
                     self.ser = None
                     self.connect_to_arduino()
-        except Exception:
-            pass
+        except Exception as e:
+            self.get_logger().warning(f"Error checking Arduino connection: {str(e)}")
+            # Try to clean up and reconnect
+            if self.ser:
+                try:
+                    self.ser.close()
+                except:
+                    pass
+            self.ser = None
 
     def cmd_vel_callback(self, msg):
         """Callback for cmd_vel messages"""
@@ -444,76 +507,74 @@ class WaffleBotNode(Node):
             return
 
         try:
-            # Use a non-blocking approach to read from serial
+            # Check if there's data available from Arduino
             if self.ser.in_waiting:
                 try:
-                    # Use read with timeout instead of readline to avoid blocking
-                    data = b""
-                    start_time = time.time()
-                    timeout = 0.1  # 100ms timeout
+                    # Read a line from the Arduino
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                     
-                    while True:
-                        # Check if we have a complete line or timeout
-                        if b'\n' in data or (time.time() - start_time) > timeout:
-                            break
-                        
-                        # Read a small chunk of data
-                        chunk = self.ser.read(min(self.ser.in_waiting, 10))
-                        if not chunk:  # No data available
-                            break
-                        data += chunk
-                    
-                    # Process data if we have it
-                    if data:
-                        try:
-                            line = data.decode().strip()
-                            parts = line.split(',')
-                            if len(parts) >= 2:
-                                left_ticks, right_ticks = map(int, parts[:2])
-                            else:
-                                self.get_logger().warning(f'Invalid encoder data: {line}')
-                                return
-                        except Exception as e:
-                            self.get_logger().warning(f'Error parsing encoder data: {str(e)}')
-                            return
+                    # Process meaningful lines only
+                    if line and "|" in line:
+                        # Look for lines that have the motor count format
+                        if "Motor 1:" in line and "Motor 2:" in line:
+                            # Shows the raw data occasionally for debugging
+                            now = self.get_clock().now()
+                            time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
+                            if time_since_last >= 5.0:  # Only log raw data every 5 seconds
+                                self.get_logger().info(f"RAW: '{line}'")
+                                
+                            # Parse the counts using the format from our test script
+                            # Format example: | 355s | Motor 1: 19794 | Motor 2: 20386 |
+                            try:
+                                # Split by pipe character and clean up
+                                parts = [part.strip() for part in line.split('|')]
+                                
+                                # Extract Motor 1 count (should be in part at index 2)
+                                for part in parts:
+                                    if "Motor 1:" in part:
+                                        motor1_str = part.replace("Motor 1:", "").strip()
+                                        try:
+                                            self.encoder1_count = int(motor1_str)
+                                        except ValueError:
+                                            pass
+                                
+                                # Extract Motor 2 count (should be in part at index 3)
+                                for part in parts:
+                                    if "Motor 2:" in part:
+                                        motor2_str = part.replace("Motor 2:", "").strip()
+                                        try:
+                                            self.encoder2_count = int(motor2_str)
+                                        except ValueError:
+                                            pass
+                                
+                                # Display encoder counts at regular intervals
+                                self.display_encoder_data()
+                            except Exception as e:
+                                if time_since_last >= 5.0:  # Log errors less frequently
+                                    self.get_logger().warning(f"Error parsing Arduino data: {str(e)}")
 
-                        dt = (self.get_clock().now() - self.last_time).nanoseconds / 1e9
-                        self.last_time = self.get_clock().now()
-
-                        left_dist = (2 * math.pi * self.wheel_radius) * (left_ticks / self.ticks_per_rev)
-                        right_dist = (2 * math.pi * self.wheel_radius) * (right_ticks / self.ticks_per_rev)
-                        dx = (left_dist + right_dist) / 2
-                        dtheta = (right_dist - left_dist) / self.wheel_base
-
-                        self.theta += dtheta
-                        self.x += dx * math.cos(self.theta)
-                        self.y += dx * math.sin(self.theta)
-
-                        odom = Odometry()
-                        odom.header.stamp = self.last_time.to_msg()
-                        odom.header.frame_id = "odom"
-                        odom.child_frame_id = "base_link"
-
-                        odom.pose.pose.position.x = self.x
-                        odom.pose.pose.position.y = self.y
-                        q = euler2quat(0, 0, self.theta)
-                        odom.pose.pose.orientation.x = q[1]
-                        odom.pose.pose.orientation.y = q[2]
-                        odom.pose.pose.orientation.z = q[3]
-                        odom.pose.pose.orientation.w = q[0]
-                        odom.twist.twist.linear.x = dx / dt if dt > 0 else 0
-                        odom.twist.twist.angular.z = dtheta / dt if dt > 0 else 0
-
-                        self.odom_pub.publish(odom)
                 except Exception as e:
-                    self.get_logger().warning(f'Error reading encoder data: {str(e)}')
+                    # Only log occasional errors to avoid flooding
+                    now = self.get_clock().now()
+                    time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
+                    if time_since_last >= 5.0:
+                        self.get_logger().warning(f"Error reading from Arduino: {str(e)}")
         except Exception as e:
-            # Catch any exceptions to prevent node from crashing
-            self.get_logger().error(f'Error in update_odometry: {str(e)}')
-            # Try to reconnect to Arduino if there's a serial error
-            if "Serial" in str(e):
-                self.get_logger().info("Attempting to reconnect to Arduino...")
-                self.connect_to_arduino()
+            # Only log occasional errors to avoid flooding
+            now = self.get_clock().now()
+            time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
+            if time_since_last >= 5.0:
+                self.get_logger().warning(f"Error in update_odometry: {str(e)}")
+            
+    def display_encoder_data(self):
+        """Display encoder readings at a reasonable frequency"""
+        now = self.get_clock().now()
+        time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
+        
+        # Only display encoder data at most once per second to avoid flooding the console
+        if time_since_last >= 1.0:
+            self.get_logger().info(f"Encoder counts - Left: {self.encoder1_count}, Right: {self.encoder2_count}")
+            self.last_encoder_display_time = now
 
     def test_motors_timer(self):
         """Periodic test of motors regardless of cmd_vel input"""
