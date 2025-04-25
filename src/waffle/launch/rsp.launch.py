@@ -17,11 +17,16 @@ def generate_launch_description():
 
     # Process the URDF file
     pkg_path = os.path.join(get_package_share_directory('waffle'))
-    xacro_file = os.path.join(pkg_path,'description','waffle_rviz.urdf.xacro')
+    xacro_file = os.path.join(pkg_path,'description','waffle.urdf.xacro')
     robot_description_config = xacro.process_file(xacro_file)
     
-    # Create a robot_state_publisher node
-    params = {'robot_description': robot_description_config.toxml(), 'use_sim_time': use_sim_time}
+    # Create a robot_state_publisher node with higher publishing frequency
+    params = {
+        'robot_description': robot_description_config.toxml(), 
+        'use_sim_time': use_sim_time,
+        'publish_frequency': 30.0  # Higher frequency for more responsive TF
+    }
+    
     node_robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -29,6 +34,15 @@ def generate_launch_description():
         parameters=[params]
     )
 
+    # Create a joint state publisher to ensure all joints have states
+    # This is helpful for static joints when no hardware interface is providing joint states
+    node_joint_state_publisher = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        parameters=[{'use_sim_time': use_sim_time}],
+        output='screen'
+    )
 
     # Launch!
     return LaunchDescription([
@@ -37,5 +51,6 @@ def generate_launch_description():
             default_value='false',
             description='Use sim time if true'),
 
+        node_joint_state_publisher,
         node_robot_state_publisher
     ])

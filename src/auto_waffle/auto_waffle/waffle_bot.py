@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
 from transforms3d.euler import euler2quat
 import serial
 import serial.tools.list_ports
@@ -11,6 +11,7 @@ import os
 import subprocess
 from Adafruit_MotorHAT import Adafruit_MotorHAT, Adafruit_DCMotor
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
+from tf2_ros import TransformBroadcaster
 
 class WaffleBotNode(Node):
     def __init__(self):
@@ -25,7 +26,7 @@ class WaffleBotNode(Node):
         self.max_angular_speed = 1.0  # Max angular speed from teleop (rad/s)
         
         # Motor configuration
-        self.m1_power_boost = 1.5  # Boost M1 power by this factor
+        # self.m1_power_boost = 1.5  # Boost M1 power by this factor
         self.swap_motors = False  # Set to True to swap M1 and M2 if wired incorrectly
         
         # Test mode flag
@@ -39,6 +40,14 @@ class WaffleBotNode(Node):
         # Arduino and encoder variables
         self.disable_arduino = False  # Set to True to disable Arduino connection attempts
         self.arduino_baudrate = 9600  # Arduino baud rate - try different values if not working
+        
+        # Specify the preferred Arduino port - change this to match your Arduino
+        # For example: /dev/ttyACM0 or /dev/ttyUSB0
+        self.preferred_arduino_port = '/dev/ttyACM0'
+        
+        # Exclude ports that might be used by other devices like LiDAR
+        self.excluded_ports = ['/dev/ttyUSB0']  # Add any ports used by LiDAR here
+        
         self.encoder1_count = 0
         self.encoder2_count = 0
         self.last_encoder_display_time = self.get_clock().now()
@@ -84,8 +93,16 @@ class WaffleBotNode(Node):
         except Exception as e:
             self.get_logger().error(f">>> Failed to create cmd_vel subscription: {str(e)}")
             return
-        
+
+        # Create odometry publisher
         self.odom_pub = self.create_publisher(Odometry, '/odom', qos_profile)
+        
+        # Initialize TF broadcaster for odometry transform
+        self.tf_broadcaster = TransformBroadcaster(self)
+        self.get_logger().info(">>> TF broadcaster initialized for odom→base_link")
+        
+        # Flag to track if odometry has been processed at least once
+        self.odometry_processed = False
         
         # Add timers
         self.last_time = self.get_clock().now()
@@ -97,6 +114,9 @@ class WaffleBotNode(Node):
         
         # Add a motor check timer
         self.create_timer(1.0, self.check_motor_hat)
+        
+        # Add dedicated timer to publish transforms at 20Hz regardless of encoder updates
+        self.tf_timer = self.create_timer(0.05, self.publish_transforms)
         
         # Add a test motor timer if test_mode is enabled
         if self.test_mode:
@@ -206,10 +226,15 @@ class WaffleBotNode(Node):
         self.y = 0.0         # Position y in meters
         self.theta = 0.0     # Orientation in radians
         
-        # Robot physical parameters
-        self.wheel_radius = 0.03   # Wheel radius in meters
-        self.wheel_base = 0.18     # Distance between wheels in meters
-        self.ticks_per_rev = 360   # Encoder ticks per wheel revolution
+        # Robot physical parameters - ensure these match the values in waffle_core.xacro
+        self.wheel_radius = 0.04     # Wheel radius in meters (40mm)
+        self.wheel_base = 0.3        # Distance between wheels in meters (300mm)
+        self.wheel_to_front = 0.06   # Distance from wheel center to front (60mm)
+        self.base_width = 0.265      # Base width in meters (265mm)
+        self.base_length = 0.265     # Base length in meters (265mm)
+        self.base_height = 0.06      # Base height in meters (60mm)
+        self.caster_height = 0.014   # Caster slider height in meters (14mm)
+        self.ticks_per_rev = 1970    # Encoder ticks per wheel revolution
         
         # Tracking variables
         self.last_encoder1 = 0     # Previous left encoder value
@@ -306,6 +331,37 @@ class WaffleBotNode(Node):
 
     def connect_to_arduino(self):
         """Try to connect to the Arduino by checking available ports."""
+        # Use the configured baud rate
+        arduino_baud_rate = self.arduino_baudrate
+        self.get_logger().info(f"Trying to connect to Arduino at {arduino_baud_rate} baud")
+        
+        # First try the preferred port if specified
+        if self.preferred_arduino_port:
+            self.get_logger().info(f"Trying preferred Arduino port: {self.preferred_arduino_port}")
+            try:
+                # Close existing connection if any
+                if self.ser and self.ser.is_open:
+                    self.ser.close()
+                
+                # Use a short timeout to avoid blocking
+                self.ser = serial.Serial(self.preferred_arduino_port, arduino_baud_rate, timeout=0.5)
+                
+                # Clear any pending data
+                if self.ser.in_waiting:
+                    self.ser.read(self.ser.in_waiting)
+                
+                # Wait for Arduino to reset and initialize
+                time.sleep(2.0)
+                
+                # Send a test message
+                self.ser.write(b'ROS:HELLO\n')
+                time.sleep(0.1)
+                
+                self.get_logger().info(f'Connected to Arduino on preferred port {self.preferred_arduino_port} at {arduino_baud_rate} baud')
+                return
+            except (serial.SerialException, OSError) as e:
+                self.get_logger().warning(f"Failed to connect to preferred port {self.preferred_arduino_port}: {str(e)}")
+        
         # Common Arduino identifiers
         arduino_ids = [
             'Arduino',
@@ -314,16 +370,24 @@ class WaffleBotNode(Node):
             'USB Serial'
         ]
         
-        # Use the configured baud rate
-        arduino_baud_rate = self.arduino_baudrate
-        self.get_logger().info(f"Trying to connect to Arduino at {arduino_baud_rate} baud")
-        
+        # Get all available ports
         ports = list(serial.tools.list_ports.comports())
         self.get_logger().info(f"Available ports: {[p.device for p in ports]}")
         
-        for port in ports:
+        # Filter out excluded ports
+        available_ports = [p for p in ports if p.device not in self.excluded_ports]
+        if len(available_ports) < len(ports):
+            self.get_logger().info(f"Excluded ports: {self.excluded_ports}")
+            self.get_logger().info(f"Remaining available ports: {[p.device for p in available_ports]}")
+        
+        # Try to connect to any remaining port that matches Arduino identifiers
+        for port in available_ports:
+            # Skip if this is an excluded port
+            if port.device in self.excluded_ports:
+                continue
+                
             # Check if any of the Arduino identifiers are in the port description
-            if any(id in port.description for id in arduino_ids) or port.device in ['/dev/ttyACM0', '/dev/ttyUSB0']:
+            if any(id in port.description for id in arduino_ids):
                 try:
                     # Close existing connection if any
                     if self.ser and self.ser.is_open:
@@ -349,8 +413,12 @@ class WaffleBotNode(Node):
                     self.get_logger().warning(f"Failed to connect to {port.device}: {str(e)}")
         
         # If no Arduino found with identifiers, try common device names
-        common_ports = ['/dev/ttyACM0', '/dev/ttyUSB0', '/dev/ttyACM1', '/dev/ttyUSB1']
+        common_ports = ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB1']
         for port in common_ports:
+            # Skip if this is an excluded port
+            if port in self.excluded_ports:
+                continue
+                
             if port not in [p.device for p in ports]:  # Skip if already checked
                 try:
                     # Close existing connection if any
@@ -423,42 +491,39 @@ class WaffleBotNode(Node):
         self.last_cmd_vel_time = self.get_clock().now()
         
         try:
-            # EMERGENCY OVERRIDE - When any cmd_vel is received, send a fixed motor command
-            # to verify that motors can respond to cmd_vel
-            
             # Check if there's any significant movement requested
             if abs(msg.linear.x) > 0.01 or abs(msg.angular.z) > 0.01:
-                # Calculate left and right PWM values
+                # Calculate base PWM values
                 left_pwm = 0
                 right_pwm = 0
                 
-                # If linear.x is positive, move forward
-                if msg.linear.x > 0:
-                    left_pwm = 70
-                    right_pwm = 50
-                # If linear.x is negative, move backward
-                elif msg.linear.x < 0:
-                    left_pwm = -70
-                    right_pwm = -50
-                # If angular.z is positive, turn left
-                elif msg.angular.z > 0:
-                    left_pwm = -70
-                    right_pwm = 50
-                # If angular.z is negative, turn right
-                elif msg.angular.z < 0:
-                    left_pwm = 70
-                    right_pwm = -50
-                else:
-                    left_pwm = 0
-                    right_pwm = 0
+                # Handle linear velocity (forward/backward)
+                if abs(msg.linear.x) > 0.01:
+                    base_pwm = 60
+                    if msg.linear.x > 0:  # Forward
+                        left_pwm = base_pwm
+                        right_pwm = base_pwm
+                    else:  # Backward
+                        left_pwm = -base_pwm
+                        right_pwm = -base_pwm
                 
-                # Apply M1 power boost
-                left_pwm = int(left_pwm * self.m1_power_boost) if left_pwm != 0 else 0
+                # Add angular velocity (turning)
+                if abs(msg.angular.z) > 0.01:
+                    turn_pwm = 20
+                    if msg.angular.z > 0:  # Left turn
+                        left_pwm -= turn_pwm
+                        right_pwm += turn_pwm
+                    else:  # Right turn
+                        left_pwm += turn_pwm
+                        right_pwm -= turn_pwm
+                
+                # # Apply M1 power boost
+                # left_pwm = int(left_pwm * self.m1_power_boost) if left_pwm != 0 else 0
                 
                 # Swap motors if configured
                 if self.swap_motors:
                     left_pwm, right_pwm = right_pwm, left_pwm
-                    
+                self.get_logger().info(f">>> LEFT PWM: {left_pwm}, RIGHT PWM: {right_pwm} angular: {msg.angular.z} linear: {msg.linear.x}")
                 self.direct_motor_control(left_pwm, right_pwm)
                 return
             
@@ -588,33 +653,46 @@ class WaffleBotNode(Node):
         d_encoder1 = self.encoder1_count - prev_encoder1
         d_encoder2 = self.encoder2_count - prev_encoder2
         
-        # If no change in encoders, nothing to update
-        if d_encoder1 == 0 and d_encoder2 == 0:
-            return
-        
-        # Calculate time difference
+        # Get current time
         current_time = self.get_clock().now()
-        dt = (current_time - self.last_time).nanoseconds / 1e9
-        self.last_time = current_time
         
-        # Skip if time difference is too small to avoid division by zero
-        if dt < 0.0001:
-            return
-        
-        # Convert encoder ticks to distance traveled by each wheel
-        left_dist = (2 * math.pi * self.wheel_radius) * (d_encoder1 / self.ticks_per_rev)
-        right_dist = (2 * math.pi * self.wheel_radius) * (d_encoder2 / self.ticks_per_rev)
-        
-        # Calculate robot's linear and angular displacement
-        dx = (left_dist + right_dist) / 2.0
-        dtheta = (right_dist - left_dist) / self.wheel_base
-        
-        # Update position and orientation
-        self.theta += dtheta
-        self.x += dx * math.cos(self.theta)
-        self.y += dx * math.sin(self.theta)
-        
-        # Create and publish odometry message
+        # If there are encoder changes, update the odometry
+        if d_encoder1 != 0 or d_encoder2 != 0:
+            # Calculate time difference
+            dt = (current_time - self.last_time).nanoseconds / 1e9
+            self.last_time = current_time
+            
+            # Skip if time difference is too small to avoid division by zero
+            if dt >= 0.0001:
+                # Convert encoder ticks to distance traveled by each wheel
+                left_dist = (2 * math.pi * self.wheel_radius) * (d_encoder1 / self.ticks_per_rev)
+                right_dist = (2 * math.pi * self.wheel_radius) * (d_encoder2 / self.ticks_per_rev)
+                
+                # Calculate robot's linear and angular displacement
+                dx = (left_dist + right_dist) / 2.0
+                dtheta = (right_dist - left_dist) / self.wheel_base
+                
+                # Update position and orientation
+                self.theta += dtheta
+                self.x += dx * math.cos(self.theta)
+                self.y += dx * math.sin(self.theta)
+                
+                # Set velocities for odometry message
+                linear_vel = dx / dt
+                angular_vel = dtheta / dt
+                
+                # Mark that we've processed odometry at least once
+                self.odometry_processed = True
+            else:
+                # Use zero velocities if dt is too small
+                linear_vel = 0.0
+                angular_vel = 0.0
+        else:
+            # No encoder changes, zero velocities
+            linear_vel = 0.0
+            angular_vel = 0.0
+            
+        # Create and publish odometry message (always do this)
         odom = Odometry()
         odom.header.stamp = current_time.to_msg()
         odom.header.frame_id = "odom"
@@ -633,8 +711,8 @@ class WaffleBotNode(Node):
         odom.pose.pose.orientation.z = q[3]
         
         # Set velocities
-        odom.twist.twist.linear.x = dx / dt
-        odom.twist.twist.angular.z = dtheta / dt
+        odom.twist.twist.linear.x = linear_vel
+        odom.twist.twist.angular.z = angular_vel
         
         # Publish odometry message
         self.odom_pub.publish(odom)
@@ -643,7 +721,8 @@ class WaffleBotNode(Node):
         time_since_last = (current_time - self.last_encoder_display_time).nanoseconds / 1e9
         if time_since_last >= 5.0:
             self.get_logger().info(f"Odometry: x={self.x:.2f}, y={self.y:.2f}, theta={self.theta:.2f}")
-            
+            self.last_encoder_display_time = current_time
+
     def display_encoder_data(self):
         """Display encoder readings at a reasonable frequency"""
         now = self.get_clock().now()
@@ -707,65 +786,96 @@ class WaffleBotNode(Node):
     def direct_motor_control(self, left_pwm, right_pwm):
         """Direct motor control with PWM values"""
         try:
-            # Don't attempt to control motors if shutting down
             if self.is_shutting_down:
-                self.get_logger().info(">>> Node is shutting down - ignoring motor commands")
                 return
-                
-            # Verify Motor HAT connection before sending commands
-            if not self.motor_hat or not self.left_motor or not self.right_motor:
-                self.get_logger().error(">>> Motors not available! Reinitializing...")
+
+            # Re-init if something's gone wrong
+            if not (self.motor_hat and self.left_motor and self.right_motor):
+                self.get_logger().error("Motors unavailable—reinitializing")
                 if not self.setup_motors():
                     return
-            
-            # Process left motor (M3)
+
+            # LEFT MOTOR
             if left_pwm > 0:
-                # Use a higher initial PWM for left motor to overcome inertia
-                initial_pwm = 150  # Higher value to give more initial power
-                self.left_motor.setSpeed(initial_pwm)
+                speed = min(left_pwm, self.max_pwm)
+                self.left_motor.setSpeed(speed)
                 self.left_motor.run(Adafruit_MotorHAT.FORWARD)
-                time.sleep(0.05)  # Short delay to let the motor overcome inertia
-                
-                # Then set to the normal speed
-                self.left_motor.setSpeed(100)
-                left_actual_pwm = 100
-                left_direction = "FORWARD"
             elif left_pwm < 0:
-                # Use a higher initial PWM for left motor to overcome inertia
-                initial_pwm = 150  # Higher value to give more initial power
-                self.left_motor.setSpeed(initial_pwm)
+                speed = min(-left_pwm, self.max_pwm)
+                self.left_motor.setSpeed(speed)
                 self.left_motor.run(Adafruit_MotorHAT.BACKWARD)
-                time.sleep(0.05)  # Short delay to let the motor overcome inertia
-                
-                # Then set to the normal speed
-                self.left_motor.setSpeed(100)
-                left_actual_pwm = 100
-                left_direction = "BACKWARD"
             else:
                 self.left_motor.run(Adafruit_MotorHAT.RELEASE)
-                left_actual_pwm = 0
-                left_direction = "RELEASE"
-            
-            # Process right motor (M2)
+
+            # RIGHT MOTOR
             if right_pwm > 0:
-                self.right_motor.setSpeed(100)
+                speed = min(right_pwm, self.max_pwm)
+                self.right_motor.setSpeed(speed)
                 self.right_motor.run(Adafruit_MotorHAT.FORWARD)
-                right_actual_pwm = 100
-                right_direction = "FORWARD"
             elif right_pwm < 0:
-                self.right_motor.setSpeed(100)
+                speed = min(-right_pwm, self.max_pwm)
+                self.right_motor.setSpeed(speed)
                 self.right_motor.run(Adafruit_MotorHAT.BACKWARD)
-                right_actual_pwm = 100
-                right_direction = "BACKWARD"
             else:
                 self.right_motor.run(Adafruit_MotorHAT.RELEASE)
-                right_actual_pwm = 0
-                right_direction = "RELEASE"
-            
+
         except Exception as e:
-            self.get_logger().error(f">>> Direct motor control failed: {str(e)}")
-            # Try to reinitialize motors
+            self.get_logger().error(f"Direct motor control failed: {e}")
             self.setup_motors()
+
+    def publish_transforms(self):
+        """Periodically publish transforms regardless of encoder updates"""
+        # Only publish transforms if we've processed at least one odometry update
+        # or if we're in a mode where odometry is disabled
+        if not self.odometry_processed and not self.disable_arduino:
+            # Don't publish transforms until we have some valid odometry data
+            return
+            
+        current_time = self.get_clock().now()
+            
+        # Create and publish odom → base_link transform
+        odom_transform = TransformStamped()
+        odom_transform.header.stamp = current_time.to_msg()
+        odom_transform.header.frame_id = "odom"
+        odom_transform.child_frame_id = "base_link"
+        
+        # Set translation
+        odom_transform.transform.translation.x = self.x
+        odom_transform.transform.translation.y = self.y
+        odom_transform.transform.translation.z = 0.0
+        
+        # Set rotation (quaternion from yaw)
+        q = euler2quat(0, 0, self.theta)
+        odom_transform.transform.rotation.w = q[0]
+        odom_transform.transform.rotation.x = q[1]
+        odom_transform.transform.rotation.y = q[2]
+        odom_transform.transform.rotation.z = q[3]
+        
+        # Create and publish base_link → base_footprint transform
+        footprint_transform = TransformStamped()
+        footprint_transform.header.stamp = current_time.to_msg()
+        footprint_transform.header.frame_id = "base_link"
+        footprint_transform.child_frame_id = "base_footprint"
+        
+        # Set translation - based on wheel_radius + caster_height from URDF
+        footprint_transform.transform.translation.x = 0.0
+        footprint_transform.transform.translation.y = 0.0
+        footprint_transform.transform.translation.z = -(self.wheel_radius + self.caster_height)  # Negative because going from base_link DOWN to base_footprint
+        
+        # Set rotation (identity quaternion - no rotation)
+        footprint_transform.transform.rotation.w = 1.0
+        footprint_transform.transform.rotation.x = 0.0
+        footprint_transform.transform.rotation.y = 0.0
+        footprint_transform.transform.rotation.z = 0.0
+        
+        # Broadcast both transforms
+        self.tf_broadcaster.sendTransform([odom_transform, footprint_transform])
+        
+        # Log odometry occasionally but not too frequently
+        time_since_last = (current_time - self.last_encoder_display_time).nanoseconds / 1e9
+        if time_since_last >= 15.0:  # Reduced frequency to avoid log spam
+            self.get_logger().info(f"Publishing TF - Odometry: x={self.x:.2f}, y={self.y:.2f}, theta={self.theta:.2f}")
+            self.last_encoder_display_time = current_time
 
 def main(args=None):
     rclpy.init(args=args)
@@ -792,8 +902,8 @@ def main(args=None):
     finally:
         # Make absolutely sure motors are stopped
         node.stop_motors()
-        node.destroy_node()
-        rclpy.shutdown()
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
