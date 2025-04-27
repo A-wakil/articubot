@@ -13,21 +13,72 @@ from Adafruit_MotorHAT import Adafruit_MotorHAT, Adafruit_DCMotor
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 from tf2_ros import TransformBroadcaster
 
+class PIDController:
+    def __init__(self, kp, ki, kd):
+        self.kp = kp  # Proportional gain
+        self.ki = ki  # Integral gain
+        self.kd = kd  # Derivative gain
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+        
+    def compute(self, error):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        
+        # Avoid division by zero
+        if dt <= 0:
+            return 0
+            
+        # Calculate derivative (rate of change of error)
+        derivative = (error - self.prev_error) / dt
+        
+        # Update integral (accumulated error)
+        self.integral += error * dt
+        
+        # Calculate PID output
+        output = (self.kp * error +           # Proportional term
+                 self.ki * self.integral +     # Integral term
+                 self.kd * derivative)         # Derivative term
+        
+        # Store values for next iteration
+        self.prev_error = error
+        self.last_time = current_time
+        
+        return output
+        
+    def reset(self):
+        """Reset PID controller state"""
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+
 class WaffleBotNode(Node):
     def __init__(self):
         super().__init__('waffle_bot_node')
         self.get_logger().info(">>> Initializing WaffleBotNode")
 
         # Motor control parameters
-        self.min_pwm = 60  # Minimum PWM to overcome motor inertia
+        self.min_pwm = 80  # Minimum PWM to overcome motor inertia
         self.max_pwm = 255  # Maximum PWM value
         self.pwm_scale = 1.0  # Scale factor for PWM values
         self.max_linear_speed = 0.5  # Max linear speed from teleop (m/s)
-        self.max_angular_speed = 1.0  # Max angular speed from teleop (rad/s)
+        self.max_angular_speed = 0.8  # Max angular speed from teleop (rad/s)
         
-        # Motor configuration
-        # self.m1_power_boost = 1.5  # Boost M1 power by this factor
+        
         self.swap_motors = False  # Set to True to swap M1 and M2 if wired incorrectly
+        
+        # Fixed calibration factor (calibrated from motor_calibration.py)
+        self.left_motor_factor = 1.015  # Calibrated value from tests
+        
+        # PID Controller for balancing motor speeds
+        # Values from calibration tests
+        self.speed_pid = PIDController(kp=0.02, ki=0.001, kd=0.01)
+        self.last_left_count = 0
+        self.last_right_count = 0
+        self.last_pid_time = time.time()
+        self.pid_enabled = True  # Enable/disable PID control
+        self.prev_direction = None  # Track previous movement direction for PID reset
         
         # Test mode flag
         self.test_mode = False  # Set to False to disable automatic motor testing
@@ -491,85 +542,61 @@ class WaffleBotNode(Node):
         self.last_cmd_vel_time = self.get_clock().now()
         
         try:
-            # Check if there's any significant movement requested
-            if abs(msg.linear.x) > 0.01 or abs(msg.angular.z) > 0.01:
-                # Calculate base PWM values
-                left_pwm = 0
-                right_pwm = 0
-                
-                # Handle linear velocity (forward/backward)
-                if abs(msg.linear.x) > 0.01:
-                    base_pwm = 60
-                    if msg.linear.x > 0:  # Forward
-                        left_pwm = base_pwm
-                        right_pwm = base_pwm
-                    else:  # Backward
-                        left_pwm = -base_pwm
-                        right_pwm = -base_pwm
-                
-                # Add angular velocity (turning)
-                if abs(msg.angular.z) > 0.01:
-                    turn_pwm = 20
-                    if msg.angular.z > 0:  # Left turn
-                        left_pwm -= turn_pwm
-                        right_pwm += turn_pwm
-                    else:  # Right turn
-                        left_pwm += turn_pwm
-                        right_pwm -= turn_pwm
-                
-                # # Apply M1 power boost
-                # left_pwm = int(left_pwm * self.m1_power_boost) if left_pwm != 0 else 0
-                
-                # Swap motors if configured
-                if self.swap_motors:
-                    left_pwm, right_pwm = right_pwm, left_pwm
-                self.get_logger().info(f">>> LEFT PWM: {left_pwm}, RIGHT PWM: {right_pwm} angular: {msg.angular.z} linear: {msg.linear.x}")
-                self.direct_motor_control(left_pwm, right_pwm)
-                return
+            # Calculate base PWM values
+            left_pwm = 0
+            right_pwm = 0
             
-            # ORIGINAL CODE - Only reached if the emergency override doesn't activate
-            # SIMPLIFIED LOGIC FOR TESTING
-            # Use direct mapping from linear.x to forward/backward
-            # and angular.z to turning
-            # Scale from -1.0 to 1.0 to -100 to 100
+            # Handle linear velocity (forward/backward)
+            if abs(msg.linear.x) > 0.01:
+                # Calculate linear PWM based on percentage of max_linear_speed
+                # Scale from 0-max_linear_speed to min_pwm-max_pwm
+                linear_percent = abs(msg.linear.x) / self.max_linear_speed
+                base_pwm = int(self.min_pwm + (self.max_pwm - self.min_pwm) * linear_percent)
+                base_pwm = min(base_pwm, self.max_pwm)  # Cap at max_pwm
+                
+                self.get_logger().info(f">>> Linear: {msg.linear.x}/{self.max_linear_speed} = {linear_percent:.2f} -> PWM {base_pwm}")
+                
+                if msg.linear.x > 0:  # Forward
+                    left_pwm = base_pwm
+                    right_pwm = base_pwm
+                else:  # Backward
+                    left_pwm = -base_pwm
+                    right_pwm = -base_pwm
             
-            # Linear velocity controls forward/backward
-            linear_pwm = int(msg.linear.x * 100)  # Scale to -100 to 100
-            
-            # Angular velocity controls turning
-            turn_pwm = int(msg.angular.z * 50)  # Scale to -50 to 50
-            
-            # Combine to get left and right wheel PWM values
-            left_pwm = linear_pwm - turn_pwm
-            right_pwm = linear_pwm + turn_pwm
+            # Add angular velocity (turning)
+            if abs(msg.angular.z) > 0.01:
+                # Calculate turn intensity based on percentage of max_angular_speed
+                # Scale from 0-max_angular_speed to 0-50% of base_pwm
+                angular_percent = abs(msg.angular.z) / self.max_angular_speed
+                # Use either a percentage of the base PWM or a minimum value to ensure turning works
+                turn_pwm = int(max(20, abs(base_pwm if 'base_pwm' in locals() else self.min_pwm) * 0.5 * angular_percent))
+                
+                self.get_logger().info(f">>> Angular: {msg.angular.z}/{self.max_angular_speed} = {angular_percent:.2f} -> PWM {turn_pwm}")
+                
+                if msg.angular.z > 0:  # Left turn
+                    left_pwm -= turn_pwm
+                    right_pwm += turn_pwm
+                else:  # Right turn
+                    left_pwm += turn_pwm
+                    right_pwm -= turn_pwm
             
             # Ensure values are within range
-            left_pwm = max(min(left_pwm, 100), -100)
-            right_pwm = max(min(right_pwm, 100), -100)
+            left_pwm = max(min(left_pwm, self.max_pwm), -self.max_pwm)
+            right_pwm = max(min(right_pwm, self.max_pwm), -self.max_pwm)
             
-            self.get_logger().info(f">>> SIMPLIFIED CONVERSION: linear_pwm={linear_pwm}, turn_pwm={turn_pwm}")
-            self.get_logger().info(f">>> SENDING TO MOTORS - Left: {left_pwm}, Right: {right_pwm}")
+            # Boost very small commands to overcome motor inertia
+            if 0 < abs(left_pwm) < self.min_pwm:
+                left_pwm = self.min_pwm if left_pwm > 0 else -self.min_pwm
+            if 0 < abs(right_pwm) < self.min_pwm:
+                right_pwm = self.min_pwm if right_pwm > 0 else -self.min_pwm
             
-            # Special case for testing: force a minimum value if small command received
-            if 0 < abs(linear_pwm) < 20 or 0 < abs(turn_pwm) < 20:
-                self.get_logger().info(">>> Small command detected - boosting signal for testing")
-                if linear_pwm > 0:
-                    linear_pwm = 30
-                elif linear_pwm < 0:
-                    linear_pwm = -30
+            # Swap motors if configured
+            if self.swap_motors:
+                left_pwm, right_pwm = right_pwm, left_pwm
                 
-                if turn_pwm > 0:
-                    turn_pwm = 20
-                elif turn_pwm < 0:
-                    turn_pwm = -20
-                    
-                left_pwm = linear_pwm - turn_pwm
-                right_pwm = linear_pwm + turn_pwm
-                left_pwm = max(min(left_pwm, 100), -100)
-                right_pwm = max(min(right_pwm, 100), -100)
-                
-                self.get_logger().info(f">>> BOOSTED SIGNALS - Left: {left_pwm}, Right: {right_pwm}")
-            
+            # Log and send motor commands for ALL incoming messages, including zeros
+            # This ensures the robot stops when zeros are sent
+            self.get_logger().info(f">>> MOTORS - Left: {left_pwm}, Right: {right_pwm} (angular: {msg.angular.z}, linear: {msg.linear.x})")
             self.direct_motor_control(left_pwm, right_pwm)
 
         except Exception as e:
@@ -626,6 +653,10 @@ class WaffleBotNode(Node):
                                 
                                 # Display encoder counts at regular intervals
                                 self.display_encoder_data()
+                                
+                                # Run PID calculation to adjust for speed differences
+                                if self.pid_enabled:
+                                    self.update_motor_pid(prev_encoder1, prev_encoder2)
                                 
                                 # Calculate and publish odometry
                                 self.calculate_and_publish_odometry(prev_encoder1, prev_encoder2)
@@ -795,6 +826,17 @@ class WaffleBotNode(Node):
                 if not self.setup_motors():
                     return
 
+            # Apply the motor calibration factor to left motor
+            if left_pwm != 0:
+                # Log the factor being applied
+                self.get_logger().info(f"Applying factor {self.left_motor_factor:.4f} to left motor")
+                left_pwm = int(left_pwm * self.left_motor_factor)
+                # Keep within PWM bounds
+                if left_pwm > 0:
+                    left_pwm = min(left_pwm, self.max_pwm)
+                else:
+                    left_pwm = max(left_pwm, -self.max_pwm)
+
             # LEFT MOTOR
             if left_pwm > 0:
                 speed = min(left_pwm, self.max_pwm)
@@ -876,6 +918,72 @@ class WaffleBotNode(Node):
         if time_since_last >= 15.0:  # Reduced frequency to avoid log spam
             self.get_logger().info(f"Publishing TF - Odometry: x={self.x:.2f}, y={self.y:.2f}, theta={self.theta:.2f}")
             self.last_encoder_display_time = current_time
+
+    def update_motor_pid(self, prev_left, prev_right):
+        """Update PID controller to balance motor speeds"""
+        current_time = time.time()
+        dt = current_time - self.last_pid_time
+        
+        # Only update if we have movement and sufficient time has passed
+        if dt > 0.1 and (prev_left != self.encoder1_count or prev_right != self.encoder2_count):
+            # Calculate speeds
+            left_delta = self.encoder1_count - prev_left
+            right_delta = self.encoder2_count - prev_right
+            
+            # Skip if both wheels are stopped
+            if left_delta == 0 and right_delta == 0:
+                return
+                
+            # Calculate the difference/error between wheels (normalized)
+            # Positive error means right wheel is faster than left
+            if left_delta != 0 or right_delta != 0:
+                # Determine current direction
+                current_direction = None
+                if left_delta > 0 and right_delta > 0:
+                    current_direction = "forward"
+                elif left_delta < 0 and right_delta < 0:
+                    current_direction = "backward"
+                
+                # Reset PID if direction changed
+                if current_direction and current_direction != self.prev_direction:
+                    self.speed_pid.reset()
+                    self.get_logger().info(f"Direction changed to {current_direction} - PID reset")
+                
+                # Store direction for next time
+                self.prev_direction = current_direction
+                
+                # Calculate speed ratio difference
+                if left_delta > 0 and right_delta > 0:
+                    # Both wheels moving forward - error is the difference in speed ratio
+                    error = (right_delta / max(1, left_delta)) - 1.0
+                    # Log every 5 seconds or for significant errors
+                    now = self.get_clock().now()
+                    time_since_last = (now - self.last_encoder_display_time).nanoseconds / 1e9
+                    if time_since_last >= 3.0:
+                        self.get_logger().info(f"Speed difference detected: L: {left_delta}, R: {right_delta}, Error: {error:.4f}")
+                elif left_delta < 0 and right_delta < 0:
+                    # Both wheels moving backward - error is the difference in speed ratio
+                    error = (right_delta / min(-1, left_delta)) - 1.0
+                else:
+                    # Mixed direction or one wheel stopped - don't adjust
+                    error = 0
+                    
+                # Only adjust if error is significant - lowered threshold 
+                if abs(error) > 0.005:
+                    # Compute PID output
+                    adjustment = self.speed_pid.compute(error)
+                    
+                    # Cap the adjustment to reasonable values - increased range
+                    adjustment = max(-0.3, min(0.3, adjustment))
+                    
+                    # Always log adjustments - more verbose
+                    self.get_logger().info(f"PID Adjustment: {adjustment:.4f} (Error: {error:.4f}, L: {left_delta}, R: {right_delta})")
+                    
+                    # Store the adjustment factor for use in direct_motor_control
+                    self.left_motor_factor = 1.015 + adjustment
+                    
+            # Update timestamp
+            self.last_pid_time = current_time
 
 def main(args=None):
     rclpy.init(args=args)
